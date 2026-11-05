@@ -65,8 +65,9 @@ def _default_headers() -> dict[str, str]:
     return {
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "App-Platform": "HA-Drivvo",
-        "App-Version": "1",
+        "App-Platform": "Web",
+        "App-Version": "19",
+        "App-Version-Name": "14.0",
         "Content-Type": "application/json",
         "Origin": "https://web.drivvo.com",
         "Referer": "https://web.drivvo.com/",
