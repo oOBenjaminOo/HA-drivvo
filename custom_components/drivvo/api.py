@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 import aiohttp
 
@@ -41,6 +43,8 @@ DISTANCE_UNITS = {1: "km", 2: "mi", 3: "h"}
 # stalled one would otherwise keep `async_setup_entry` pending forever.
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 LOGIN_URL = f"{BASE_URL}/autenticacao/login"
+
+_T = TypeVar("_T")
 
 
 class DrivvoApiError(Exception):
@@ -93,6 +97,9 @@ class DrivvoApiClient:
             password.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
         self.token: str | None = None
+        # Serialises re-authentication: when several requests hit an expired
+        # token, only the first one logs in again; the others reuse its token.
+        self._login_lock = asyncio.Lock()
 
     async def login(self) -> str:
         try:
@@ -120,6 +127,30 @@ class DrivvoApiClient:
             self.token = token
             return token
 
+    async def _reauthenticate(self, rejected_token: str | None, path: str) -> None:
+        """Log in again unless another request already replaced the token."""
+        async with self._login_lock:
+            if self.token != rejected_token:
+                return
+            _LOGGER.debug("Token rejected for %s; re-authenticating", path)
+            await self.login()
+
+    async def _with_reauth(
+        self, path: str, request: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        """Run a request, re-authenticating and retrying exactly once on 401/403.
+
+        A second rejection propagates as DrivvoAuthError so Home Assistant can
+        start its reauthentication flow.
+        """
+        token = self.token
+        try:
+            return await request()
+        except DrivvoAuthError:
+            pass
+        await self._reauthenticate(token, path)
+        return await request()
+
     def _auth_headers(self) -> dict[str, str]:
         if not self.token:
             raise DrivvoApiError("Client is not authenticated; call login() first")
@@ -131,7 +162,9 @@ class DrivvoApiClient:
         url = f"{BASE_URL}{path}"
         started = time.monotonic()
         try:
-            return await self._get_json_inner(url, path)
+            return await self._with_reauth(
+                path, lambda: self._get_json_inner(url, path)
+            )
         except aiohttp.ClientError as err:
             raise DrivvoApiError("Connection to Drivvo failed") from err
         except TimeoutError as err:
@@ -168,7 +201,9 @@ class DrivvoApiClient:
 
     async def _post_json(self, path: str, payload: dict[str, Any]) -> Any:
         try:
-            return await self._post_json_inner(path, payload)
+            return await self._with_reauth(
+                path, lambda: self._post_json_inner(path, payload)
+            )
         except aiohttp.ClientError as err:
             raise DrivvoApiError("Connection to Drivvo failed") from err
         except TimeoutError as err:

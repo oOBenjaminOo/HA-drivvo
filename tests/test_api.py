@@ -176,13 +176,16 @@ async def test_get_requires_token(mock_aioresponse, call):
     ],
 )
 async def test_get_json_error_branches(mock_aioresponse, status, expected):
+    # repeat: a 401/403 triggers one re-login before the error surfaces.
     mock_aioresponse.post(
         "https://api.drivvo.com/autenticacao/login",
         payload=load("login_ok.json"),
+        repeat=True,
     )
     mock_aioresponse.get(
         "https://api.drivvo.com/veiculo/web",
         status=status,
+        repeat=True,
     )
 
     async with ClientSession() as session:

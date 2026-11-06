@@ -4,6 +4,8 @@ Uses a hand-rolled session stub rather than aioresponses, which does not yet
 support aiohttp 3.14 (the version Home Assistant pins).
 """
 
+import asyncio
+
 import pytest
 
 from custom_components.drivvo.api import (
@@ -93,13 +95,135 @@ async def test_add_record_surfaces_the_server_message():
         await client.add_record("servico", {})
 
 
+_LOGIN = ("POST", "/autenticacao/login")
+
+
+def _calls_to(session, path):
+    return [c for c in session.calls if c[1] == f"https://api.drivvo.com{path}"]
+
+
+def _rejects_token(session, rejected, ok):
+    """Answer 401 while the request carries the rejected token, else `ok`."""
+
+    def respond():
+        if session.calls[-1][3].get("x-token") == rejected:
+            return _FakeResponse(401)
+        return ok
+
+    return respond
+
+
 @pytest.mark.asyncio
 async def test_add_record_raises_auth_error_on_rejected_token():
-    session = _FakeSession({("POST", "/despesa"): _FakeResponse(401)})
+    session = _FakeSession(
+        {
+            ("POST", "/despesa"): _FakeResponse(401),
+            _LOGIN: _FakeResponse(200, {"token": "fresh"}),
+        }
+    )
     client = _client(session)
 
     with pytest.raises(DrivvoAuthError):
         await client.add_record("despesa", {})
+
+
+@pytest.mark.asyncio
+async def test_expired_token_is_renewed_and_the_read_retried():
+    session = _FakeSession({_LOGIN: _FakeResponse(200, {"token": "fresh"})})
+    session.routes[("GET", "/veiculo/web")] = _rejects_token(
+        session, "tok", _FakeResponse(200, [{"id_veiculo": 1}])
+    )
+    client = _client(session)
+
+    assert await client.get_vehicles() == [{"id_veiculo": 1}]
+    assert [(c[0], c[1].removeprefix("https://api.drivvo.com")) for c in session.calls] == [
+        ("GET", "/veiculo/web"),
+        _LOGIN,
+        ("GET", "/veiculo/web"),
+    ]
+    assert session.calls[-1][3]["x-token"] == "fresh"
+    assert client.token == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_expired_token_is_renewed_and_the_write_retried():
+    session = _FakeSession({_LOGIN: _FakeResponse(200, {"token": "fresh"})})
+    session.routes[("POST", "/combustivel")] = _rejects_token(
+        session, "tok", _FakeResponse(200, {"id_abastecimento": 9})
+    )
+    client = _client(session)
+
+    assert await client.add_record("combustivel", {"odometro": 1}) == {
+        "id_abastecimento": 9
+    }
+    retried = _calls_to(session, "/combustivel")
+    assert len(retried) == 2
+    assert retried[1][2] == {"odometro": 1}
+    assert retried[1][3]["x-token"] == "fresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_second_rejection_raises_without_further_retry(status):
+    session = _FakeSession(
+        {
+            ("GET", "/veiculo/web"): _FakeResponse(status),
+            _LOGIN: _FakeResponse(200, {"token": "fresh"}),
+        }
+    )
+    client = _client(session)
+
+    with pytest.raises(DrivvoAuthError):
+        await client.get_vehicles()
+    assert len(_calls_to(session, "/veiculo/web")) == 2
+    assert len(_calls_to(session, "/autenticacao/login")) == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_relogin_raises_auth_error():
+    session = _FakeSession(
+        {("GET", "/veiculo/web"): _FakeResponse(401), _LOGIN: _FakeResponse(401)}
+    )
+    client = _client(session)
+
+    with pytest.raises(DrivvoAuthError):
+        await client.get_vehicles()
+    assert len(_calls_to(session, "/veiculo/web")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 500])
+async def test_other_errors_are_not_retried(status):
+    session = _FakeSession({("GET", "/veiculo/web"): _FakeResponse(status)})
+    client = _client(session)
+
+    with pytest.raises(DrivvoApiError) as exc:
+        await client.get_vehicles()
+    assert not isinstance(exc.value, DrivvoAuthError)
+    assert len(session.calls) == 1
+
+
+class _SlowResponse(_FakeResponse):
+    async def __aenter__(self):
+        await asyncio.sleep(0)
+        return self
+
+
+@pytest.mark.asyncio
+async def test_concurrent_rejections_share_a_single_login():
+    session = _FakeSession({_LOGIN: _SlowResponse(200, {"token": "fresh"})})
+    for path in ("/veiculo/1", "/veiculo/2"):
+        session.routes[("GET", path)] = _rejects_token(
+            session, "tok", _FakeResponse(200, {"path": path})
+        )
+    client = _client(session)
+
+    results = await asyncio.gather(
+        client._get_json("/veiculo/1"), client._get_json("/veiculo/2")
+    )
+
+    assert results == [{"path": "/veiculo/1"}, {"path": "/veiculo/2"}]
+    assert len(_calls_to(session, "/autenticacao/login")) == 1
 
 
 @pytest.mark.asyncio
@@ -113,7 +237,12 @@ async def test_optional_module_missing_does_not_break_the_poll():
 
 @pytest.mark.asyncio
 async def test_optional_module_still_propagates_auth_failure():
-    session = _FakeSession({("GET", "/veiculo/1/lembrete/web"): _FakeResponse(403)})
+    session = _FakeSession(
+        {
+            ("GET", "/veiculo/1/lembrete/web"): _FakeResponse(403),
+            _LOGIN: _FakeResponse(200, {"token": "fresh"}),
+        }
+    )
     client = _client(session)
 
     with pytest.raises(DrivvoAuthError):
